@@ -561,6 +561,11 @@ export interface ChatState {
    */
   compact: () => Promise<void>;
   /**
+   * Ask the active native session to clear/reset its terminal-owned context.
+   * No-ops when there is no active conversation.
+   */
+  clearContext: () => Promise<void>;
+  /**
    * Refetch runner-backed session state for the active conversation.
    *
    * Used when a native runner comes online after being unreachable: the
@@ -1348,6 +1353,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postEvent(conversationId, { type: "compact", data: {} });
+  },
+
+  clearContext: async () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    await postEvent(conversationId, { type: "clear", data: {} });
   },
 
   refreshSessionState: async (conversationId) => {
