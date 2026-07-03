@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -11439,6 +11440,7 @@ async def test_events_compact_on_codex_native_injects_slash_command(
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
 
+    monkeypatch.setenv("OMNIGENT_NATIVE_COMPACT_OBSERVE_TIMEOUT_S", "0")
     captured: list[tuple[str, list[str]]] = []
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
@@ -11522,6 +11524,94 @@ async def test_events_compact_on_codex_native_injects_slash_command(
 
 
 @pytest.mark.asyncio
+async def test_events_compact_on_native_session_returns_503_on_terminal_failure_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Claude-native compact inspects terminal output for CLI-level failure text.
+
+    A successful tmux injection is not the same as successful compaction:
+    Claude can accept ``/compact`` and then print "Not enough messages to
+    compact" in the pane. The runner must return 503 and publish
+    ``response.compaction.failed`` so the web UI is not left believing the
+    context was reduced.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import ExecutorSpec
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+    ) -> None:
+        """Pretend the slash command was successfully typed."""
+        del bridge_dir, command, timeout_s, auto_confirm
+
+    def _fake_capture_pane(socket_path: str, tmux_target: str) -> str:
+        """Return the native CLI failure that used to be invisible."""
+        del socket_path, tmux_target
+        return "Error: Not enough messages to compact"
+
+    def _fake_wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
+        """Return a live pane target without depending on bridge-file state."""
+        del bridge_dir, timeout_s
+        return {"socket_path": str(tmp_path / "claude.sock"), "tmux_target": "main"}
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture_pane)
+    monkeypatch.setattr(claude_native_bridge, "_wait_for_tmux_info", _fake_wait_for_tmux_info)
+    monkeypatch.setenv("OMNIGENT_NATIVE_COMPACT_OBSERVE_TIMEOUT_S", "0")
+    monkeypatch.setattr(
+        "omnigent.runner.app._auto_create_claude_terminal",
+        AsyncMock(return_value=None),
+    )
+
+    conv_id = "conv_native_compact_terminal_fail"
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json().get("error") == "claude_native_compact_failed"
+    failed = [e for e in queued_events if e.get("type") == "response.compaction.failed"]
+    assert len(failed) == 1, f"Expected one compaction failed event; got {queued_events!r}."
+    assert failed[0].get("error", {}).get("code") == "native_compact_failed"
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> None:
     """
     Codex-native compact returns 204 when no live terminal is registered.
@@ -11569,6 +11659,81 @@ async def test_events_compact_on_codex_native_returns_204_when_no_terminal() -> 
         f"Codex-native compact with no terminal must return 204; "
         f"got {resp.status_code}: {resp.text}"
     )
+
+
+@pytest.mark.asyncio
+async def test_events_compact_on_codex_native_returns_503_on_terminal_failure_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Codex-native compact treats known terminal failure text as failed compaction.
+
+    This is the deadlock case: tmux injection succeeds, but Codex prints that
+    compaction could not reduce the conversation below the context limit. The
+    runner must surface that as 503 plus ``response.compaction.failed`` rather
+    than returning 200 for injection success.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    captured: list[tuple[str, list[str]]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        """Record tmux send-keys calls without touching tmux."""
+        captured.append((socket_path, list(args)))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setenv("OMNIGENT_NATIVE_COMPACT_OBSERVE_TIMEOUT_S", "0")
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "conv_codex_compact_terminal_fail"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    instance._remember_pane_snapshot(
+        "Compaction failed: could not be reduced below the context limit"
+    )
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "compact"},
+        )
+
+        queued_events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json().get("error") == "codex_native_compact_failed"
+    assert len(captured) == 3, f"Expected injection before failure detection; got {captured!r}."
+    failed = [e for e in queued_events if e.get("type") == "response.compaction.failed"]
+    assert len(failed) == 1, f"Expected one compaction failed event; got {queued_events!r}."
+    assert failed[0].get("error", {}).get("code") == "native_compact_failed"
 
 
 @pytest.mark.asyncio

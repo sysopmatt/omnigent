@@ -3177,6 +3177,7 @@ export function buildSlashCommandMap(
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
+    if (name === "/clear" && !showCompact) continue;
     m[name] = description;
   }
   for (const skill of skills) {
@@ -3897,6 +3898,21 @@ export function Composer({
           .compact()
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Compact failed");
+          });
+        return true;
+      case "/clear":
+        if (!showCompact) {
+          setCommandError("/clear is not supported for this agent type");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        void useChatStore
+          .getState()
+          .clearContext()
+          .catch((err: unknown) => {
+            setCommandError(err instanceof Error ? err.message : "Clear failed");
           });
         return true;
       case "/effort": {

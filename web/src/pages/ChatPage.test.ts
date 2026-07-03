@@ -937,18 +937,23 @@ describe("buildSlashCommandMap", () => {
   it("omits /compact when showCompact is false", () => {
     const map = buildSlashCommandMap([], true, true, false);
     expect(map["/compact"]).toBeUndefined();
+    expect(map["/clear"]).toBeUndefined();
     expect(map["/effort"]).toBe(BUILTIN_SLASH_COMMANDS["/effort"]);
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
   });
 
-  it("includes /compact by default and when showCompact is true", () => {
+  it("includes /compact and /clear by default and when showCompact is true", () => {
     // Default (no showCompact arg) → included for backward compat.
     expect(buildSlashCommandMap([], true, true)["/compact"]).toBe(
       BUILTIN_SLASH_COMMANDS["/compact"],
     );
+    expect(buildSlashCommandMap([], true, true)["/clear"]).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
     // Explicit true → included.
     expect(buildSlashCommandMap([], true, true, true)["/compact"]).toBe(
       BUILTIN_SLASH_COMMANDS["/compact"],
+    );
+    expect(buildSlashCommandMap([], true, true, true)["/clear"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/clear"],
     );
   });
 

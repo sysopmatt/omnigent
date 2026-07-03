@@ -256,6 +256,56 @@ async def test_compact_errors_when_runner_injection_fails(
     )
 
 
+async def test_compact_errors_when_runner_transport_fails(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner transport failure is not the same as "no runner".
+
+    ``_forward_session_change_to_runner`` historically returned ``None`` for
+    both cases. For explicit compact that is unsafe: ``None`` means AP-side
+    compaction should run only when no runner is bound, not when a native
+    runner exists but the HTTP forward failed.
+    """
+    from omnigent.runtime import set_runner_client
+
+    async def _must_not_run(**_: Any) -> CompactionResult:
+        """Fail loudly if AP-side compaction is reached on transport failure."""
+        raise AssertionError(
+            "compact_conversation_now must not run when forwarding /compact "
+            "to the runner failed at the transport layer."
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.compact_conversation_now",
+        _must_not_run,
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Simulate a bound runner whose transport is unavailable."""
+        raise httpx.ConnectError("runner tunnel unavailable", request=request)
+
+    runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(runner)
+    try:
+        agent = await create_test_agent(client)
+        sid = await _create_session(client, agent["id"])
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact", "data": {}},
+        )
+    finally:
+        await runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 500, resp.text
+    assert "Compaction failed: runner returned 503" in resp.text
+
+
 # ── external_compaction_status: terminal-observed compaction edge ────────
 #
 # The claude-native forwarder posts external_compaction_status when Claude

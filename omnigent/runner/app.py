@@ -11932,6 +11932,70 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    _NATIVE_COMPACT_FAILURE_SIGNALS: tuple[tuple[str, str], ...] = (
+        (
+            "not enough messages to compact",
+            "The native CLI reported that there are not enough messages to compact.",
+        ),
+        (
+            "could not be reduced below the context limit",
+            "The native CLI could not reduce this conversation below the context limit.",
+        ),
+    )
+    _NATIVE_COMPACT_OBSERVE_TIMEOUT_S = float(
+        os.environ.get("OMNIGENT_NATIVE_COMPACT_OBSERVE_TIMEOUT_S", "2.0")
+    )
+    _NATIVE_COMPACT_OBSERVE_POLL_S = float(
+        os.environ.get("OMNIGENT_NATIVE_COMPACT_OBSERVE_POLL_S", "0.1")
+    )
+
+    def _native_compact_failure_reason(pane_text: str | None) -> str | None:
+        """Return a user-facing reason when a known native compact failure appears."""
+        if not pane_text:
+            return None
+        lowered = pane_text.casefold()
+        for needle, reason in _NATIVE_COMPACT_FAILURE_SIGNALS:
+            if needle in lowered:
+                return reason
+        return None
+
+    async def _observe_native_compact_failure(
+        read_pane_text: Callable[[], str | None],
+        *,
+        timeout_s: float = _NATIVE_COMPACT_OBSERVE_TIMEOUT_S,
+        poll_s: float = _NATIVE_COMPACT_OBSERVE_POLL_S,
+    ) -> str | None:
+        """Briefly inspect pane output for native CLI compaction failure text."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            try:
+                reason = await asyncio.to_thread(
+                    lambda: _native_compact_failure_reason(read_pane_text())
+                )
+            except Exception:
+                _logger.exception("Failed while inspecting native compact pane output")
+                return None
+            if reason is not None:
+                return reason
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(max(0.01, poll_s), remaining))
+
+    def _publish_native_compact_failed(conv_id: str, reason: str) -> None:
+        """Dismiss the compaction spinner and surface the terminal failure."""
+        _publish_event(
+            conv_id,
+            {
+                "type": "response.compaction.failed",
+                "task_id": conv_id,
+                "error": {
+                    "code": "native_compact_failed",
+                    "message": reason,
+                },
+            },
+        )
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         """
         Type ``/compact`` into Claude's tmux pane.
@@ -11957,6 +12021,7 @@ def create_runner_app(
             not attached, so there is nothing to compact).
         """
         from omnigent.claude_native_bridge import (
+            _wait_for_tmux_info,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -11989,6 +12054,22 @@ def create_runner_app(
                     "detail": _client_safe_error_detail(exc, context="claude-native compact"),
                 },
             )
+        with contextlib.suppress(RuntimeError):
+            tmux_info = _wait_for_tmux_info(bridge_dir, timeout_s=0.1)
+            from omnigent.claude_native_bridge import _capture_pane
+
+            reason = await _observe_native_compact_failure(
+                lambda: _capture_pane(tmux_info["socket_path"], tmux_info["tmux_target"])
+            )
+            if reason is not None:
+                _publish_native_compact_failed(conv_id, reason)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "claude_native_compact_failed",
+                        "detail": reason,
+                    },
+                )
         return Response(status_code=200)
 
     async def _handle_codex_native_compact(conv_id: str) -> Response:
@@ -12033,6 +12114,70 @@ def create_runner_app(
                 content={
                     "error": "codex_native_compact_failed",
                     "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                },
+            )
+        from omnigent.claude_native_bridge import _capture_pane
+
+        reason = await _observe_native_compact_failure(
+            lambda: _capture_pane(socket_path, target) or instance.last_pane_text()
+        )
+        if reason is not None:
+            _publish_native_compact_failed(conv_id, reason)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_compact_failed",
+                    "detail": reason,
+                },
+            )
+        return Response(status_code=200)
+
+    async def _handle_claude_native_clear(conv_id: str) -> Response:
+        """Type ``/clear`` into Claude's tmux pane to reset its native context."""
+        from omnigent.claude_native_bridge import (
+            bridge_dir_for_bridge_id,
+            inject_slash_command,
+        )
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        try:
+            await asyncio.to_thread(
+                inject_slash_command,
+                bridge_dir_for_bridge_id(bridge_id),
+                command="/clear",
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_clear_failed",
+                    "detail": _client_safe_error_detail(exc, context="claude-native clear"),
+                },
+            )
+        return Response(status_code=200)
+
+    async def _handle_codex_native_clear(conv_id: str) -> Response:
+        """Type ``/clear`` into Codex's tmux pane to reset its native context."""
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            return Response(status_code=204)
+
+        socket_path = str(instance.socket_path)
+        target = instance.tmux_target
+
+        try:
+            await asyncio.to_thread(_inject_codex_slash_command, socket_path, target, "/clear")
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_clear_failed",
+                    "detail": _client_safe_error_detail(exc, context="codex-native clear"),
                 },
             )
         return Response(status_code=200)
@@ -12312,13 +12457,16 @@ def create_runner_app(
         :param target: Tmux target pane, e.g. ``"main"``.
         :raises RuntimeError: If any ``tmux send-keys`` invocation fails.
         """
+        _inject_codex_slash_command(socket_path, target, "/compact")
+
+    def _inject_codex_slash_command(socket_path: str, target: str, command: str) -> None:
+        """Blocking helper: type a literal slash command into a codex tmux pane."""
         from omnigent.claude_native_bridge import _run_tmux
 
-        # Clear any draft the user is mid-typing.
+        if not command.startswith("/") or "\n" in command or "\r" in command:
+            raise ValueError(f"invalid codex slash command: {command!r}")
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
-        # Paste ``/compact`` literally.
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
-        # Submit.
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, command)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
     async def _handle_hermes_native_compact(conv_id: str) -> Response:
@@ -15517,6 +15665,10 @@ def create_runner_app(
             # terminal on a brand-new session (see the handler). Other harnesses
             # 204 no-op — their clear is an AP-side conversation reset the server
             # performs without runner involvement.
+            if _session_harness_name(conversation_id) == "claude-native":
+                return await _handle_claude_native_clear(conversation_id)
+            if _session_harness_name(conversation_id) == "codex-native":
+                return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
             return Response(status_code=204)

@@ -7860,6 +7860,8 @@ async def _forward_session_change_to_runner(
     session_id: str,
     runner_router: Any,
     event: dict[str, Any],
+    *,
+    surface_transport_errors: bool = False,
 ) -> _RunnerForwardResult | None:
     """
     Best-effort POST a control event to the bound runner.
@@ -7899,10 +7901,12 @@ async def _forward_session_change_to_runner(
         ``{"type": "effort_change", "effort": "high"}``,
         ``{"type": "model_change", "model": "claude-opus-4-7"}``, or
         ``{"type": "compact"}``.
+    :param surface_transport_errors: When ``True``, transport failures return a
+        synthetic 503 result instead of ``None`` so callers like explicit
+        ``compact`` do not mistake a broken runner connection for "no runner".
     :returns: The runner's HTTP status/body, or ``None`` when no
-        runner client could be resolved or the POST failed at the
-        transport layer (in both cases the AP-side persisted value /
-        operation is the authoritative fallback).
+        runner client could be resolved. Transport-layer POST failures also
+        return ``None`` unless *surface_transport_errors* is true.
     """
     from omnigent.runtime import get_runner_client
 
@@ -7917,12 +7921,14 @@ async def _forward_session_change_to_runner(
             json=event,
             timeout=5.0,
         )
-    except (httpx.HTTPError, ConnectionError):
+    except (httpx.HTTPError, ConnectionError) as exc:
         _logger.exception(
             "Session-change forward failed for session=%r type=%r",
             session_id,
             event.get("type"),
         )
+        if surface_transport_errors:
+            return _RunnerForwardResult(status_code=503, body=str(exc))
         return None
     if resp.status_code >= 400:
         _logger.warning(
@@ -18857,6 +18863,7 @@ def create_sessions_router(
                 session_id,
                 runner_router,
                 {"type": _COMPACT_TYPE},
+                surface_transport_errors=True,
             )
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}
@@ -18872,6 +18879,24 @@ def create_sessions_router(
                 agent_cache,
             )
             return {"queued": False}
+        if body.type == "clear":
+            runner_result = await _forward_session_change_to_runner(
+                session_id,
+                runner_router,
+                {"type": "clear"},
+                surface_transport_errors=True,
+            )
+            if runner_result is not None and runner_result.status_code == 200:
+                return {"queued": False}
+            if runner_result is not None and runner_result.status_code != 204:
+                raise OmnigentError(
+                    f"Clear failed: runner returned {runner_result.status_code}",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            raise OmnigentError(
+                "/clear is not supported for this session",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if body.type == "compaction":
             import uuid as _uuid
 
